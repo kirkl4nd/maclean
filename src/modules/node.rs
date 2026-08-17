@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use walkdir::WalkDir;
+
 use crate::core::{
     IssueKind, Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult,
     Relevance, Safety, ScanContext, ScanIssue, delete_contents, delete_tree, dir_size, dir_size_in,
@@ -100,56 +102,58 @@ impl NodeModule {
         let path = ctx.path("node", cache.key, cache.path);
         path.is_dir().then_some(path)
     }
-
-    fn find_node_modules(roots: &[PathBuf], issues: &mut Vec<ScanIssue>) -> Vec<PathBuf> {
-        let mut found = Vec::new();
-        for root in roots {
-            if !root.is_dir() {
-                continue;
-            }
-            collect_node_modules(root, 0, 6, &mut found, issues);
-        }
-        found.sort();
-        found.dedup();
-        found
-    }
 }
 
-fn collect_node_modules(
-    dir: &Path,
-    depth: usize,
-    max: usize,
-    out: &mut Vec<PathBuf>,
-    issues: &mut Vec<ScanIssue>,
-) {
-    if depth > max {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(err) => {
-            if issues.len() < 8 {
-                issues.push(ScanIssue::permission(dir, err.to_string()));
+/// Walk each search root only. Do not follow symlinks: a Wine `z:` drive
+/// is a link to `/`, and `Path::is_dir` would happily walk `/opt` from `~`.
+fn find_node_modules(roots: &[PathBuf], issues: &mut Vec<ScanIssue>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .max_depth(6)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.path()
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|n| n == "node_modules")
+                {
+                    return false;
+                }
+                if !e.file_type().is_dir() {
+                    return true;
+                }
+                let name = e.file_name().to_string_lossy();
+                if name == "node_modules" {
+                    return true;
+                }
+                !skip_walk_dir(&name)
+            })
+        {
+            match entry {
+                Ok(e) if e.file_type().is_dir() && e.file_name() == "node_modules" => {
+                    found.push(e.path().to_path_buf());
+                }
+                Err(err) => {
+                    if issues.len() < 8 {
+                        let p = err
+                            .path()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| root.clone());
+                        issues.push(ScanIssue::permission(p, err.to_string()));
+                    }
+                }
+                _ => {}
             }
-            return;
         }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "node_modules" {
-            out.push(path);
-            continue;
-        }
-        if skip_walk_dir(&name) {
-            continue;
-        }
-        collect_node_modules(&path, depth + 1, max, out, issues);
     }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Which package manager a project uses, read from its lockfile.
@@ -284,7 +288,7 @@ impl Module for NodeModule {
         }
 
         let mut projects = Vec::new();
-        for dir in Self::find_node_modules(&Self::roots(ctx), &mut scan.issues) {
+        for dir in find_node_modules(&Self::roots(ctx), &mut scan.issues) {
             if ctx.cancelled() {
                 return scan;
             }
@@ -447,4 +451,62 @@ fn clear_cache(
         format!("cleared the {} ({})", cache.name, format_bytes(freed)),
         ctx.dry_run,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn touch_dir(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn finds_node_modules_under_the_search_root() {
+        let root = std::env::temp_dir().join(format!("maclean-nm-ok-{}", std::process::id()));
+        let modules = root.join("proj/node_modules");
+        touch_dir(&modules);
+        let mut issues = Vec::new();
+        let found = find_node_modules(&[root.clone()], &mut issues);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(found, vec![modules]);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn does_not_follow_a_symlink_out_of_the_search_root() {
+        let tmp = std::env::temp_dir().join(format!("maclean-nm-link-{}", std::process::id()));
+        let root = tmp.join("home");
+        let outside = tmp.join("opt/homebrew/lib/node_modules");
+        touch_dir(&outside);
+        touch_dir(&root);
+        std::os::unix::fs::symlink(tmp.join("opt"), root.join("opt-link")).unwrap();
+        let mut issues = Vec::new();
+        let found = find_node_modules(&[root], &mut issues);
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            found.is_empty(),
+            "followed a symlink out of the root: {found:?}"
+        );
+    }
+
+    #[test]
+    fn wine_z_drive_does_not_escape_to_root() {
+        let tmp = std::env::temp_dir().join(format!("maclean-nm-wine-{}", std::process::id()));
+        let home = tmp.join("home");
+        let outside = tmp.join("opt/homebrew/lib/node_modules");
+        touch_dir(&outside);
+        let dos = home.join(".wine/dosdevices");
+        touch_dir(&dos);
+        std::os::unix::fs::symlink("/", dos.join("z:")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("opt"), dos.join("opt-also")).unwrap();
+        let mut issues = Vec::new();
+        let found = find_node_modules(&[home], &mut issues);
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            found.iter().all(|p| !p.to_string_lossy().contains("/opt/")),
+            "wine-style symlink escaped the home root: {found:?}"
+        );
+    }
 }

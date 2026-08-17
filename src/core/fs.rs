@@ -14,6 +14,9 @@ pub const SKIP_WALK_DIRS: &[&str] = &[
     ".local",
     ".rustup",
     ".cargo",
+    // Wine maps dosdevices/z: to /. Even without following that link, the
+    // prefix is a Windows tree, not a project folder we should search.
+    ".wine",
 ];
 
 pub fn skip_walk_dir(name: &str) -> bool {
