@@ -1,0 +1,26 @@
+[package]
+name = "maclean"
+version = "0.9.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Find and reclaim disk space on macOS"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kirkl4nd/maclean"
+homepage = "https://github.com/kirkl4nd/maclean"
+keywords = ["macos", "disk", "cleanup", "tui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+cargo_toml = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+dirs = "6"
+glob = "0.3"
+plist = "1.7"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+walkdir = "2"
