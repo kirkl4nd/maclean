@@ -2,7 +2,7 @@
 
 Finds reclaimable disk space on macOS. Run it in a terminal and you get a TUI. Pass a subcommand if you need it in a script.
 
-I built this for machines with a lot of project folders — `node_modules`, `target`, Docker images, that kind of thing. Anyone trying to free space on a Mac can use it. It is a power-user tool. It will not run as root. If something needs a password, it asks once, for that action only.
+I built this for machines with a lot of project folders - `node_modules`, `target`, etc.
 
 macOS only.
 
