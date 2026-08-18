@@ -8,8 +8,8 @@ use walkdir::WalkDir;
 
 use crate::core::{
     Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult, Relevance,
-    Safety, ScanContext, delete_contents, delete_tree, dir_size_in, exists_named_within,
-    format_bytes, run_command, skip_walk_dir,
+    Safety, ScanContext, ScheduleTarget, delete_contents, delete_tree, dir_size_in,
+    exists_named_within, format_bytes, run_command, skip_walk_dir,
 };
 
 /// Minimum `target/` size to report. Tiny incremental leftovers aren't worth listing.
@@ -68,6 +68,21 @@ impl Module for CargoModule {
 
     fn searches(&self) -> bool {
         true
+    }
+
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        vec![
+            ScheduleTarget::new(
+                "cargo:projects",
+                "Project build output",
+                "cargo clean in every project found when the job runs",
+            ),
+            ScheduleTarget::new(
+                "cargo:registry",
+                "Registry and git cache",
+                "Shared crates and git deps under ~/.cargo",
+            ),
+        ]
     }
 
     fn info(&self, ctx: &ScanContext) -> ModuleInfo {

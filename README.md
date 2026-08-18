@@ -10,11 +10,11 @@ macOS only.
 
 Needs a Rust toolchain.
 
-    cargo install --git https://github.com/kirkl4nd/maclean
-
-Once it is on crates.io:
-
     cargo install maclean
+
+From git, if you want a specific checkout:
+
+    cargo install --git https://github.com/kirkl4nd/maclean
 
 Homebrew is not set up yet. When it is, the formula should run `maclean uninstall` before it deletes the binary, so launchd jobs do not get left behind.
 
@@ -36,10 +36,18 @@ Config and logs stay unless you ask:
     maclean                          # TUI
     maclean scan
     maclean reclaim cargo:foo --yes
-    maclean schedule add spotify:cache --every 2w
+    maclean schedule add cargo:projects --every 1d
+    maclean schedule add cargo:projects node:caches --every 1w
     maclean schedule list
 
-In the TUI, `s` manages scheduled jobs. Do not edit the plist files by hand.
+In the TUI, `s` opens the schedule manager. From there, `+` creates a job: pick what should run (module actions, not a scan result), then how often. Do not edit the plist files by hand.
+
+Jobs are per-user LaunchAgents. They run while you are logged in. "Every week" means about seven days since the last successful run, not seven days of the Mac staying on.
+
+- Restart or log out does not reset that clock.
+- If a run is overdue when you next log in, it runs then.
+- Missed weeks are not stacked: three weeks away is one run, not three.
+- Sleep: an overdue job usually runs on wake.
 
 ## Config
 

@@ -24,7 +24,7 @@ pub use issue::{IssueKind, Privilege, ReclaimError, Relevance, ScanIssue};
 pub use item::{Detail, Item, Safety};
 pub use module::{
     Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimResult, ScanContext, ScanEvent,
-    find_in_forest, reclaim_node,
+    ScheduleTarget, find_in_forest, module_of_selector, reclaim_node, resolve_selector,
 };
 pub use registry::Registry;
 pub use text::plural;

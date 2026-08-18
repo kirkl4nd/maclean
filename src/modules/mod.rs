@@ -56,4 +56,30 @@ mod tests {
         let dirs = registry.path_dirs();
         assert!(dirs.contains(&"/Applications/Docker.app/Contents/Resources/bin"));
     }
+
+    #[test]
+    fn schedule_targets_are_unique_and_namespaced() {
+        let registry = registry();
+        let mut seen = std::collections::HashSet::new();
+        for target in registry.schedule_targets() {
+            let module = target.id.split(':').next().unwrap_or("");
+            assert!(
+                registry.get(module).is_some(),
+                "selector '{}' does not belong to a module",
+                target.id
+            );
+            assert!(
+                crate::schedule::valid_selector(target.id),
+                "selector '{}' is not a valid job id",
+                target.id
+            );
+            assert!(
+                seen.insert(target.id),
+                "duplicate schedule target '{}'",
+                target.id
+            );
+        }
+        assert!(seen.contains("cargo:projects"));
+        assert!(!seen.iter().any(|id| id.starts_with("timemachine:")));
+    }
 }

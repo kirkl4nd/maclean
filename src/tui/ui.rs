@@ -6,8 +6,9 @@ use ratatui::widgets::{
 };
 
 use crate::core::{Privilege, Safety, format_bytes, plural};
+use crate::schedule;
 
-use super::app::{App, Check, ConfigRowKind, ModuleState, ModuleStatus, Screen};
+use super::app::{App, Check, ConfigRowKind, ModuleState, ModuleStatus, PickRow, Screen};
 use super::theme::{Theme, glyph};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -50,8 +51,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Results => draw_results(frame, app, chunks[4]),
         Screen::Help => draw_help(frame, chunks[4]),
         Screen::Jobs => draw_jobs(frame, app, chunks[4]),
+        Screen::JobPick => draw_pick(frame, app, chunks[4]),
         Screen::Schedule => {
-            draw_jobs(frame, app, chunks[4]);
+            if app.schedule_return == Screen::JobPick {
+                draw_pick(frame, app, chunks[4]);
+            } else {
+                draw_jobs(frame, app, chunks[4]);
+            }
             draw_schedule(frame, app);
         }
     }
@@ -99,7 +105,7 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Review => "review",
         Screen::Working => "cleaning",
         Screen::Results => "results",
-        Screen::Jobs | Screen::Schedule => "schedule",
+        Screen::Jobs | Screen::JobPick | Screen::Schedule => "schedule",
         Screen::Help => "keys",
     };
 
@@ -816,12 +822,7 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::styled("Nothing is scheduled yet.", Theme::strong()),
                 Line::from(""),
                 Line::styled(
-                    "Pick a single reclaimable row in the disk view and press s. maclean writes the job; don't edit LaunchAgents by hand.",
-                    Theme::muted(),
-                ),
-                Line::from(""),
-                Line::styled(
-                    "From this screen, + adds the row you were on, - removes a job, enter changes how often it runs.",
+                    "Press + to create a job. Pick what it should run, then how often. maclean writes the job; don't edit LaunchAgents by hand.",
                     Theme::muted(),
                 ),
             ])
@@ -838,14 +839,14 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, (title, item_id, interval))| {
+        .map(|(i, row)| {
             let here = cursor == Some(i);
             let shown = truncate(
-                title,
-                width.saturating_sub(2 + interval.chars().count() + 2),
+                &row.title,
+                width.saturating_sub(2 + row.interval.chars().count() + 2),
             );
             let pad = width
-                .saturating_sub(2 + shown.chars().count() + interval.chars().count())
+                .saturating_sub(2 + shown.chars().count() + row.interval.chars().count())
                 .max(1);
             let mut lines = vec![Line::from(vec![
                 cursor_span(here),
@@ -859,7 +860,7 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
                 ),
                 Span::raw(" ".repeat(pad)),
                 Span::styled(
-                    interval.clone(),
+                    row.interval.clone(),
                     if here {
                         Theme::selected_muted()
                     } else {
@@ -867,11 +868,11 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
                     },
                 ),
             ])];
-            if title != item_id {
+            if row.title != row.detail {
                 lines.push(Line::from(vec![
                     cursor_span(here),
                     Span::styled(
-                        item_id.clone(),
+                        truncate(&row.detail, width.saturating_sub(2)),
                         if here {
                             Theme::selected_muted()
                         } else {
@@ -880,6 +881,17 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                 ]));
             }
+            lines.push(Line::from(vec![
+                cursor_span(here),
+                Span::styled(
+                    truncate(&row.stats, width.saturating_sub(2)),
+                    if here {
+                        Theme::selected_muted()
+                    } else {
+                        Theme::muted()
+                    },
+                ),
+            ]));
             lines.push(Line::from(""));
             ListItem::new(lines)
         })
@@ -901,6 +913,82 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+fn draw_pick(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.pick_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled("Nothing can be scheduled.", Theme::strong()),
+                Line::from(""),
+                Line::styled(
+                    "No module currently offers a recurring action.",
+                    Theme::muted(),
+                ),
+            ])
+            .wrap(Wrap { trim: true })
+            .block(gutter_block()),
+            area,
+        );
+        return;
+    }
+
+    let width = area.width.saturating_sub(GUTTER * 2) as usize;
+    let cursor = app.pick_state.selected();
+    let checks: Vec<Check> = app.pick_rows.iter().map(|r| app.pick_check(r)).collect();
+    let items: Vec<ListItem> = app
+        .pick_rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| pick_item(row, checks[i], cursor == Some(i), width))
+        .collect();
+    let list = List::new(items).block(gutter_block());
+    frame.render_stateful_widget(list, area, &mut app.pick_state);
+}
+
+fn pick_item(row: &PickRow, check: Check, here: bool, width: usize) -> ListItem<'static> {
+    let indent = " ".repeat(TREE_INDENT * row.depth);
+    let (box_glyph, box_style) = match check {
+        Check::None => (" ", Theme::muted()),
+        Check::Empty => (glyph::BOX_EMPTY, Theme::muted()),
+        Check::Partial => (glyph::BOX_PARTIAL, Theme::accent()),
+        Check::Full => (glyph::BOX_FULL, Theme::accent()),
+    };
+    let body_prefix = indent.chars().count() + 1 + 2;
+    let prefix = 2 + body_prefix;
+    let title = truncate(&row.title, width.saturating_sub(prefix + 1));
+    let title_style = if here {
+        Theme::selected()
+    } else if row.selector.is_none() {
+        Theme::strong()
+    } else {
+        Theme::base()
+    };
+    let mut lines = vec![Line::from(vec![
+        cursor_span(here),
+        Span::styled(indent, Theme::muted()),
+        Span::styled(format!("{box_glyph}  "), box_style),
+        Span::styled(title, title_style),
+    ])];
+    if !row.summary.is_empty() {
+        let sub = truncate(&row.summary, width.saturating_sub(2 + body_prefix));
+        lines.push(Line::from(vec![
+            cursor_span(here),
+            Span::raw(" ".repeat(body_prefix)),
+            Span::styled(
+                sub,
+                if here {
+                    Theme::selected_muted()
+                } else {
+                    Theme::muted()
+                },
+            ),
+        ]));
+    }
+    if row.selector.is_none() {
+        lines.push(Line::from(""));
+    }
+    ListItem::new(lines)
+}
+
 fn draw_schedule(frame: &mut Frame, app: &mut App) {
     let area = centered(frame.area(), 56, 13);
     frame.render_widget(Clear, area);
@@ -909,7 +997,7 @@ fn draw_schedule(frame: &mut Frame, app: &mut App) {
         .border_type(BorderType::Rounded)
         .border_style(Theme::muted())
         .padding(Padding::new(3, 3, 1, 1))
-        .title(Line::styled("  Run this automatically  ", Theme::strong()));
+        .title(Line::styled("  How often  ", Theme::strong()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -934,10 +1022,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("a", "review the selection, then clean"),
         ("m", "every module — config lives on that page"),
         ("r", "scan again"),
-        (
-            "s",
-            "scheduled jobs — add this row, or manage existing ones",
-        ),
+        ("s", "scheduled jobs"),
         ("q", "quit, from anywhere"),
     ];
     let mut lines = vec![Line::styled("Keys", Theme::heading()), Line::from("")];
@@ -957,6 +1042,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "    maclean never runs as root. Rows marked ! ask for a password once.",
         Theme::muted(),
     ));
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        format!("    {}", crate::CREDIT),
+        Theme::muted(),
+    ));
     frame.render_widget(Paragraph::new(lines).block(gutter_block()), area);
 }
 
@@ -971,8 +1061,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         app.jobs_state
             .selected()
             .and_then(|i| app.jobs.get(i))
-            .map(|j| format!("{} · {}", j.item_id, j.every.display()))
+            .map(|j| {
+                format!(
+                    "{} · {} · {}",
+                    j.selectors.join(" "),
+                    j.every.display(),
+                    schedule::job_stats(&j.id).summary()
+                )
+            })
             .unwrap_or_default()
+    } else if app.screen == Screen::JobPick {
+        format!("{} selected", app.pick_selected.len())
     } else {
         String::new()
     };
@@ -985,7 +1084,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = match app.screen {
-        Screen::Scan => &[("q", "quit"), ("?", "keys")],
+        Screen::Scan => &[("s", "schedule"), ("q", "quit"), ("?", "keys")],
         Screen::Tree => &[
             ("space", "select"),
             ("*", "all"),
@@ -1011,6 +1110,7 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Details => &[("esc", "back"), ("q", "quit")],
         Screen::Modules => &[
             ("enter", "details"),
+            ("s", "schedule"),
             ("r", "rescan"),
             ("esc", "back"),
             ("q", "quit"),
@@ -1019,11 +1119,18 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Working => &[],
         Screen::Results => &[("enter", "scan again"), ("q", "quit")],
         Screen::Jobs => &[
-            ("enter", "change"),
-            ("+", "add"),
+            ("+", "new"),
+            ("enter", "how often"),
             ("-", "remove"),
             ("esc", "back"),
             ("q", "quit"),
+        ],
+        Screen::JobPick => &[
+            ("space", "select"),
+            ("enter", "next"),
+            ("*", "all"),
+            ("-", "none"),
+            ("esc", "back"),
         ],
         Screen::Schedule => &[("enter", "confirm"), ("esc", "cancel")],
         Screen::Help => &[("esc", "back")],

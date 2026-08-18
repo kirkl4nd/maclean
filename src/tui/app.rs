@@ -23,6 +23,7 @@ pub enum Screen {
     Working,
     Results,
     Jobs,
+    JobPick,
     Schedule,
     Help,
 }
@@ -92,6 +93,22 @@ pub struct ConfigRow {
     pub value: String,
 }
 
+/// One line in the schedule action picker. Module headers have no selector.
+pub struct PickRow {
+    pub depth: usize,
+    pub title: String,
+    pub summary: String,
+    pub selector: Option<String>,
+    pub children: Vec<String>,
+}
+
+pub struct JobRow {
+    pub title: String,
+    pub detail: String,
+    pub interval: String,
+    pub stats: String,
+}
+
 pub struct Outcome {
     pub title: String,
     pub ok: bool,
@@ -125,6 +142,7 @@ pub struct App {
     pub review_state: ListState,
     pub results_state: ListState,
     pub jobs_state: ListState,
+    pub pick_state: ListState,
     pub schedule_state: ListState,
 
     pub screen: Screen,
@@ -147,7 +165,11 @@ pub struct App {
 
     pub jobs: Vec<ScheduledJob>,
     pub schedule_choices: Vec<(&'static str, &'static str)>,
-    pub schedule_item: Option<String>,
+    pub schedule_selectors: Vec<String>,
+    pub pick_rows: Vec<PickRow>,
+    pub pick_selected: HashSet<String>,
+    jobs_return: Screen,
+    pub schedule_return: Screen,
 
     scan_rx: Option<Receiver<ScanEvent>>,
     clean_rx: Option<Receiver<CleanEvent>>,
@@ -189,6 +211,7 @@ impl App {
             review_state: ListState::default(),
             results_state: ListState::default(),
             jobs_state: ListState::default(),
+            pick_state: ListState::default(),
             schedule_state: ListState::default(),
             screen: Screen::Scan,
             prev_screen: Screen::Tree,
@@ -213,7 +236,11 @@ impl App {
                 ("2w", "Every 2 weeks"),
                 ("4w", "Every 4 weeks"),
             ],
-            schedule_item: None,
+            schedule_selectors: Vec::new(),
+            pick_rows: Vec::new(),
+            pick_selected: HashSet::new(),
+            jobs_return: Screen::Tree,
+            schedule_return: Screen::Jobs,
             scan_rx: None,
             clean_rx: None,
         };
@@ -466,6 +493,7 @@ impl App {
             Screen::Working => {}
             Screen::Results => self.keys_results(key.code),
             Screen::Jobs => self.keys_jobs(key.code),
+            Screen::JobPick => self.keys_pick(key.code),
             Screen::Schedule => self.keys_schedule(key.code),
             Screen::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
@@ -484,6 +512,7 @@ impl App {
         match code {
             KeyCode::Esc => self.quit(),
             KeyCode::Char('?') => self.open_help(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.open_jobs(),
             _ => {}
         }
     }
@@ -584,6 +613,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right => self.open_module_details(),
             KeyCode::Char('r') | KeyCode::Char('R') => self.start_scan(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.open_jobs(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
@@ -619,6 +649,7 @@ impl App {
                 move_sel(&mut self.results_state, self.outcomes.len(), -1)
             }
             KeyCode::Char('r') | KeyCode::Char('R') => self.start_scan(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.open_jobs(),
             _ => {}
         }
     }
@@ -626,7 +657,7 @@ impl App {
     fn keys_jobs(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Left => {
-                self.screen = Screen::Tree;
+                self.screen = self.jobs_return;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 move_sel(&mut self.jobs_state, self.jobs.len(), 1)
@@ -634,13 +665,43 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.jobs_state, self.jobs.len(), -1),
             KeyCode::Enter => {
                 if self.jobs.is_empty() {
-                    self.begin_schedule_from_tree();
+                    self.begin_pick();
                 } else {
                     self.edit_selected_job();
                 }
             }
-            KeyCode::Char('+') => self.begin_schedule_from_tree(),
+            KeyCode::Char('+') => self.begin_pick(),
             KeyCode::Char('-') | KeyCode::Delete | KeyCode::Backspace => self.remove_selected_job(),
+            KeyCode::Char('?') => self.open_help(),
+            _ => {}
+        }
+    }
+
+    fn keys_pick(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Left => {
+                self.screen = Screen::Jobs;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_sel(&mut self.pick_state, self.pick_rows.len(), 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_sel(&mut self.pick_state, self.pick_rows.len(), -1)
+            }
+            KeyCode::Char(' ') => self.toggle_pick(),
+            KeyCode::Char('*') => {
+                for row in &self.pick_rows {
+                    if let Some(id) = &row.selector {
+                        self.pick_selected.insert(id.clone());
+                    }
+                }
+                self.status = format!("{} selected", self.pick_selected.len());
+            }
+            KeyCode::Char('-') => {
+                self.pick_selected.clear();
+                self.status = "Nothing selected.".into();
+            }
+            KeyCode::Enter | KeyCode::Right => self.confirm_pick(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
@@ -649,8 +710,8 @@ impl App {
     fn keys_schedule(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc | KeyCode::Char('n') => {
-                self.schedule_item = None;
-                self.screen = Screen::Jobs;
+                self.schedule_selectors.clear();
+                self.screen = self.schedule_return;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 move_sel(&mut self.schedule_state, self.schedule_choices.len(), 1)
@@ -1177,27 +1238,15 @@ impl App {
     }
 
     fn open_jobs(&mut self) {
+        if !matches!(
+            self.screen,
+            Screen::Jobs | Screen::JobPick | Screen::Schedule
+        ) {
+            self.jobs_return = self.screen;
+        }
         self.status.clear();
         self.reload_jobs();
-
-        match self.current_schedule_target() {
-            Ok(id) => {
-                if let Some(idx) = self.jobs.iter().position(|j| j.item_id == id) {
-                    self.jobs_state.select(Some(idx));
-                    self.screen = Screen::Jobs;
-                    self.status = format!(
-                        "{} is already scheduled {}",
-                        id,
-                        self.jobs[idx].every.display()
-                    );
-                } else {
-                    self.begin_schedule(id);
-                }
-            }
-            Err(_) => {
-                self.screen = Screen::Jobs;
-            }
-        }
+        self.screen = Screen::Jobs;
     }
 
     fn reload_jobs(&mut self) {
@@ -1220,51 +1269,126 @@ impl App {
         }
     }
 
-    /// Title shown in the jobs list: the scan's name for this item, if we
-    /// still have it, otherwise the id the job was created with.
-    fn job_title(&self, job: &ScheduledJob) -> String {
-        self.find(&job.item_id)
-            .map(|i| i.title.clone())
-            .unwrap_or_else(|| job.item_id.clone())
+    fn selector_title(&self, id: &str) -> String {
+        self.registry
+            .schedule_targets()
+            .into_iter()
+            .find(|t| t.id == id)
+            .map(|t| t.title.to_string())
+            .unwrap_or_else(|| id.to_string())
     }
 
-    /// Owned rows for the jobs list, so the UI can draw without borrowing
-    /// `jobs` and `forest` at the same time.
-    pub fn job_list_rows(&self) -> Vec<(String, String, String)> {
+    fn job_title(&self, job: &ScheduledJob) -> String {
+        job.selectors
+            .iter()
+            .map(|id| self.selector_title(id))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    pub fn job_list_rows(&self) -> Vec<JobRow> {
         self.jobs
             .iter()
-            .map(|job| {
-                (
-                    self.job_title(job),
-                    job.item_id.clone(),
-                    job.every.display(),
-                )
+            .map(|job| JobRow {
+                title: self.job_title(job),
+                detail: job.selectors.join(" "),
+                interval: job.every.display(),
+                stats: schedule::job_stats(&job.id).summary(),
             })
             .collect()
     }
 
-    fn current_schedule_target(&self) -> Result<String, &'static str> {
-        let Some(row) = self.selected_row() else {
-            return Err("Pick a single thing to run on a schedule.");
-        };
-        let Some(item) = self.find(&row.id) else {
-            return Err("Pick a single thing to run on a schedule.");
-        };
-        schedule_target(row.privilege, item)
-    }
-
-    fn begin_schedule_from_tree(&mut self) {
-        match self.current_schedule_target() {
-            Ok(id) => self.begin_schedule(id),
-            Err(msg) => self.status = msg.into(),
+    pub fn pick_check(&self, row: &PickRow) -> Check {
+        if row.children.is_empty() {
+            return Check::None;
+        }
+        let selected = row
+            .children
+            .iter()
+            .filter(|id| self.pick_selected.contains(*id))
+            .count();
+        if selected == 0 {
+            Check::Empty
+        } else if selected == row.children.len() {
+            Check::Full
+        } else {
+            Check::Partial
         }
     }
 
-    fn begin_schedule(&mut self, item_id: String) {
+    fn begin_pick(&mut self) {
+        self.pick_rows.clear();
+        self.pick_selected.clear();
+        for module in self.registry.iter() {
+            let targets = module.schedule_targets();
+            if targets.is_empty() {
+                continue;
+            }
+            let children: Vec<String> = targets.iter().map(|t| t.id.to_string()).collect();
+            self.pick_rows.push(PickRow {
+                depth: 0,
+                title: module.name().into(),
+                summary: module.description().into(),
+                selector: None,
+                children: children.clone(),
+            });
+            for target in targets {
+                self.pick_rows.push(PickRow {
+                    depth: 1,
+                    title: target.title.into(),
+                    summary: target.summary.into(),
+                    selector: Some(target.id.into()),
+                    children: vec![target.id.into()],
+                });
+            }
+        }
+        self.pick_state.select(if self.pick_rows.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        self.status = "Pick what this job should run.".into();
+        self.screen = Screen::JobPick;
+    }
+
+    fn toggle_pick(&mut self) {
+        let Some(idx) = self.pick_state.selected() else {
+            return;
+        };
+        let Some(row) = self.pick_rows.get(idx) else {
+            return;
+        };
+        let units = row.children.clone();
+        if units.is_empty() {
+            return;
+        }
+        let all_on = units.iter().all(|id| self.pick_selected.contains(id));
+        for id in units {
+            if all_on {
+                self.pick_selected.remove(&id);
+            } else {
+                self.pick_selected.insert(id);
+            }
+        }
+        self.status = format!("{} selected", self.pick_selected.len());
+    }
+
+    fn confirm_pick(&mut self) {
+        if self.pick_selected.is_empty() {
+            self.status = "Pick at least one action.".into();
+            return;
+        }
+        let mut selectors: Vec<String> = self.pick_selected.iter().cloned().collect();
+        selectors.sort();
+        self.begin_interval(selectors);
+    }
+
+    fn begin_interval(&mut self, selectors: Vec<String>) {
+        let id = schedule::job_id(&selectors);
         let idx = self
             .jobs
             .iter()
-            .find(|j| j.item_id == item_id)
+            .find(|j| j.id == id)
             .and_then(|job| {
                 self.schedule_choices.iter().position(|(every, _)| {
                     schedule::parse_every(every)
@@ -1273,9 +1397,9 @@ impl App {
                 })
             })
             .unwrap_or(0);
-        self.schedule_item = Some(item_id.clone());
+        self.schedule_return = self.screen;
+        self.schedule_selectors = selectors;
         self.schedule_state.select(Some(idx));
-        self.status = format!("Scheduling {item_id}");
         self.screen = Screen::Schedule;
     }
 
@@ -1286,14 +1410,14 @@ impl App {
         let Some(job) = self.jobs.get(idx) else {
             return;
         };
-        self.begin_schedule(job.item_id.clone());
+        self.begin_interval(job.selectors.clone());
     }
 
     fn remove_selected_job(&mut self) {
         let Some(idx) = self.jobs_state.selected() else {
             return;
         };
-        let Some(id) = self.jobs.get(idx).map(|j| j.item_id.clone()) else {
+        let Some(id) = self.jobs.get(idx).map(|j| j.id.clone()) else {
             return;
         };
         match schedule::current().remove(&id) {
@@ -1306,49 +1430,45 @@ impl App {
     }
 
     fn apply_schedule(&mut self) {
-        let Some(item_id) = self.schedule_item.clone() else {
+        if self.schedule_selectors.is_empty() {
             return;
-        };
+        }
         let Some(idx) = self.schedule_state.selected() else {
             return;
         };
         let Some((every, _)) = self.schedule_choices.get(idx) else {
             return;
         };
+        let selectors = self.schedule_selectors.clone();
         match schedule::parse_every(every).and_then(|every| {
+            let id = schedule::job_id(&selectors);
             let job = ScheduledJob {
-                item_id: item_id.clone(),
+                id: id.clone(),
+                selectors: selectors.clone(),
                 every,
-                command: schedule::maclean_command(&item_id)?,
+                command: schedule::maclean_command(&id, &selectors, every.seconds)?,
                 schema: schedule::JOB_SCHEMA,
             };
             schedule::current().add(&job)?;
             Ok(job)
         }) {
             Ok(job) => {
-                let id = job.item_id.clone();
+                let id = job.id.clone();
                 self.reload_jobs();
-                if let Some(idx) = self.jobs.iter().position(|j| j.item_id == id) {
+                if let Some(idx) = self.jobs.iter().position(|j| j.id == id) {
                     self.jobs_state.select(Some(idx));
                 }
-                self.status = format!("Scheduled {} {}", job.item_id, job.every.display());
+                self.status = format!(
+                    "Scheduled {} {}",
+                    job.selectors.join(" "),
+                    job.every.display()
+                );
             }
             Err(err) => self.status = format!("{err}"),
         }
-        self.schedule_item = None;
+        self.schedule_selectors.clear();
         self.screen = Screen::Jobs;
     }
-}
-
-fn schedule_target(privilege: Privilege, item: &Item) -> Result<String, &'static str> {
-    if privilege == Privilege::Admin {
-        return Err("Admin actions cannot be scheduled — nothing can type the password for you.");
-    }
-    let leaves = item.reclaimable_leaves();
-    if leaves.len() != 1 {
-        return Err("Pick a single thing to run on a schedule.");
-    }
-    Ok(leaves[0].id.clone())
 }
 
 fn collect_chosen(item: &Item, selected: &HashSet<String>, out: &mut Vec<Item>) {
@@ -1452,7 +1572,7 @@ fn move_sel(state: &mut ListState, len: usize, delta: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Privilege, Safety};
+    use crate::core::Safety;
 
     fn leaf(id: &str) -> Item {
         Item::new("t", id, id).with_reclaimable(true).with_bytes(1)
@@ -1513,32 +1633,5 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "cargo:proj");
         assert!(!rows[0].has_children);
-    }
-
-    #[test]
-    fn schedule_target_accepts_a_single_reclaimable_leaf() {
-        let leaf = Item::new("t", "spotify:cache", "Cache")
-            .with_reclaimable(true)
-            .with_bytes(1);
-        assert_eq!(
-            schedule_target(Privilege::None, &leaf).unwrap(),
-            "spotify:cache"
-        );
-    }
-
-    #[test]
-    fn schedule_target_rejects_admin_and_groups() {
-        let leaf = Item::new("t", "spotify:cache", "Cache")
-            .with_reclaimable(true)
-            .with_bytes(1);
-        assert!(schedule_target(Privilege::Admin, &leaf).is_err());
-
-        let group = Item::new("t", "spotify", "Spotify").with_children(vec![
-            leaf.clone(),
-            Item::new("t", "spotify:other", "Other")
-                .with_reclaimable(true)
-                .with_bytes(1),
-        ]);
-        assert!(schedule_target(Privilege::None, &group).is_err());
     }
 }

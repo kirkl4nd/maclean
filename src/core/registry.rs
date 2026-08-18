@@ -106,6 +106,30 @@ impl Registry {
         Ok(scan_one(module, ctx))
     }
 
+    /// Scan even when relevance would skip, so a scheduled selector can
+    /// still find work that appeared after the job was written.
+    pub fn scan_module_for_reclaim(&self, id: &str, ctx: &ScanContext) -> Result<ModuleScan> {
+        let Some(module) = self.get(id) else {
+            bail!("unknown module '{id}'");
+        };
+        if !ctx.module_enabled(id) {
+            return Ok(ModuleScan::new(
+                module.id(),
+                module.name(),
+                Relevance::no("disabled in config"),
+            ));
+        }
+        let relevance = module.relevance(ctx);
+        if ctx.cancelled() {
+            return Ok(ModuleScan::new(module.id(), module.name(), relevance));
+        }
+        Ok(module.scan(ctx, relevance))
+    }
+
+    pub fn schedule_targets(&self) -> Vec<crate::core::ScheduleTarget> {
+        self.iter().flat_map(|m| m.schedule_targets()).collect()
+    }
+
     pub fn tree(&self, ctx: &ScanContext) -> Vec<Item> {
         let mut roots: Vec<Item> = self
             .scan_all(ctx)

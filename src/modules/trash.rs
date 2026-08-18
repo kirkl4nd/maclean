@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::core::{
     IssueKind, Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult,
-    Relevance, Safety, ScanContext, ScanIssue, allocated_bytes, delete_contents, delete_tree,
-    dir_size_in, format_bytes, plural,
+    Relevance, Safety, ScanContext, ScanIssue, ScheduleTarget, allocated_bytes, delete_contents,
+    delete_tree, dir_size_in, format_bytes, plural,
 };
 
 /// Finder bookkeeping that is not worth a row of its own.
@@ -57,6 +57,14 @@ impl Module for TrashModule {
 
     fn paths(&self) -> Vec<(&'static str, &'static str)> {
         vec![("dir", ".Trash")]
+    }
+
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        vec![ScheduleTarget::new(
+            "trash:contents",
+            "Empty Trash",
+            "Deletes everything in ~/.Trash when the job runs",
+        )]
     }
 
     fn info(&self, ctx: &ScanContext) -> ModuleInfo {

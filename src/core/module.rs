@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use super::config::{self, AppConfig, ConfigError, ModuleSpec};
-use super::issue::{Privilege, ReclaimError, Relevance, ScanIssue};
+use super::issue::{IssueKind, Privilege, ReclaimError, Relevance, ScanIssue};
 use super::item::Item;
 
 /// Per-scan configuration shared with every module.
@@ -275,8 +275,18 @@ impl ModuleScan {
         if !self.relevance.relevant {
             return None;
         }
-        if self.items.is_empty() && self.issues.is_empty() {
-            return None;
+        if self.items.is_empty() {
+            // Permission noise from walking home is not a row. Full Disk Access
+            // (Trash) still belongs on the tree so you can see why nothing is listed.
+            let blocking = self.issues.iter().any(|i| {
+                matches!(
+                    i.kind,
+                    IssueKind::NeedsFullDiskAccess | IssueKind::NeedsAdmin
+                )
+            });
+            if !blocking {
+                return None;
+            }
         }
         let mut root = Item::new(&self.module_id, &self.module_id, &self.module_name)
             .with_summary(self.relevance.reason.clone())
@@ -341,11 +351,42 @@ pub trait Module: Send + Sync {
         false
     }
 
+    /// Actions that can be scheduled without a scan. The job looks these
+    /// ids up when it runs, so a project that does not exist yet is fine.
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        Vec::new()
+    }
+
     fn relevance(&self, ctx: &ScanContext) -> Relevance;
 
     fn scan(&self, ctx: &ScanContext, relevance: Relevance) -> ModuleScan;
 
     fn reclaim(&self, item: &Item, ctx: &ReclaimContext) -> Result<ReclaimResult, ReclaimError>;
+}
+
+/// A reclaim action that exists whether or not this scan found anything.
+#[derive(Debug, Clone)]
+pub struct ScheduleTarget {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub summary: &'static str,
+}
+
+impl ScheduleTarget {
+    pub fn new(id: &'static str, title: &'static str, summary: &'static str) -> Self {
+        Self { id, title, summary }
+    }
+}
+
+/// Module id a selector belongs to (`cargo:projects` → `cargo`).
+pub fn module_of_selector(selector: &str) -> &str {
+    selector.split(':').next().unwrap_or(selector)
+}
+
+/// Find the node a scheduled selector names. Missing means nothing to do
+/// this run, not an error — the project may not exist yet.
+pub fn resolve_selector<'a>(forest: &'a [Item], selector: &str) -> Option<&'a Item> {
+    find_in_forest(forest, selector)
 }
 
 pub fn reclaim_node(
@@ -405,5 +446,18 @@ mod tests {
         let mut ctx = ScanContext::for_home(PathBuf::from("/Users/example"));
         assert!(ctx.add_roots(["/"]).is_err());
         assert!(ctx.cli_roots.is_empty());
+    }
+
+    #[test]
+    fn tree_root_hides_permission_noise_without_items() {
+        let mut scan = ModuleScan::new("node", "Node.js", Relevance::yes("found npm"));
+        scan.issues
+            .push(ScanIssue::permission("/tmp", "Permission denied"));
+        assert!(scan.tree_root().is_none());
+
+        let mut scan = ModuleScan::new("trash", "Trash", Relevance::yes("could not list"));
+        scan.issues
+            .push(ScanIssue::full_disk_access("needs Full Disk Access"));
+        assert!(scan.tree_root().is_some());
     }
 }

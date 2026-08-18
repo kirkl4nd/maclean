@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use crate::core::{
     Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult, Relevance,
-    Safety, ScanContext, delete_contents, dir_size, dir_size_in, format_bytes, run_command,
+    Safety, ScanContext, ScheduleTarget, delete_contents, dir_size, dir_size_in, format_bytes,
+    run_command,
 };
 
 pub struct HomebrewModule;
@@ -30,6 +31,14 @@ impl Module for HomebrewModule {
 
     fn paths(&self) -> Vec<(&'static str, &'static str)> {
         vec![("cache", "Library/Caches/Homebrew")]
+    }
+
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        vec![ScheduleTarget::new(
+            "homebrew:cache",
+            "Homebrew cache",
+            "Downloaded bottles and cask artifacts",
+        )]
     }
 
     fn info(&self, ctx: &ScanContext) -> ModuleInfo {

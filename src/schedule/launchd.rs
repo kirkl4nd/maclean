@@ -1,8 +1,11 @@
 //! macOS scheduled jobs via launchd.
 //!
 //! Jobs live as `~/Library/LaunchAgents/com.maclean.job.*.plist`.
-//! The plist *is* the job: ProgramArguments is a full `maclean reclaim … --yes`
-//! invocation. There is no side database, so deleting the plist deletes the job.
+//! The plist is the job definition: ProgramArguments is a full
+//! `maclean reclaim … --yes --job … --every …` invocation. Last-run
+//! stats live in `~/Library/Logs/maclean/history.jsonl` so "every week"
+//! means time since the last successful run, not time since login.
+//! Deleting the plist deletes the job.
 //!
 //! Identity is [`super::is_maclean_job`]: prefix plus our schema keys (or the
 //! original Comment, for jobs written before schema 1). Uninstall walks that
@@ -10,14 +13,14 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use plist::{Dictionary, Value};
 
 use super::{
-    COMMENT, ITEM_KEY, JOB_SCHEMA, LABEL_PREFIX, MANAGED_KEY, SCHEMA_KEY, ScheduledJob, Scheduler,
-    is_maclean_job,
+    COMMENT, EVERY_KEY, ITEM_KEY, JOB_ID_KEY, JOB_SCHEMA, LABEL_PREFIX, MANAGED_KEY, SCHEMA_KEY,
+    SELECTORS_KEY, ScheduledJob, Scheduler, is_maclean_job, job_id, poll_seconds,
 };
 
 pub struct LaunchdScheduler;
@@ -36,8 +39,8 @@ impl LaunchdScheduler {
         Ok(dir)
     }
 
-    fn plist_path(item_id: &str) -> Result<PathBuf> {
-        Ok(Self::agents_dir()?.join(format!("{}.plist", label_for(item_id))))
+    fn plist_path(job_id: &str) -> Result<PathBuf> {
+        Ok(Self::agents_dir()?.join(format!("{}.plist", label_for(job_id))))
     }
 
     fn uid() -> Result<u32> {
@@ -51,6 +54,8 @@ impl LaunchdScheduler {
         let target = format!("gui/{uid}/{label}");
         let _ = Command::new("launchctl")
             .args(["bootout", &target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         let domain = format!("gui/{uid}");
         let status = Command::new("launchctl")
@@ -68,6 +73,8 @@ impl LaunchdScheduler {
         let target = format!("gui/{uid}/{label}");
         let _ = Command::new("launchctl")
             .args(["bootout", &target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         Ok(())
     }
@@ -85,7 +92,7 @@ impl LaunchdScheduler {
                 jobs.push(job);
             }
         }
-        jobs.sort_by(|a, b| a.job.item_id.cmp(&b.job.item_id));
+        jobs.sort_by(|a, b| a.job.id.cmp(&b.job.id));
         Ok(jobs)
     }
 
@@ -106,17 +113,17 @@ impl Scheduler for LaunchdScheduler {
     }
 
     fn add(&self, job: &ScheduledJob) -> Result<()> {
-        let label = label_for(&job.item_id);
-        let path = Self::plist_path(&job.item_id)?;
+        let label = label_for(&job.id);
+        let path = Self::plist_path(&job.id)?;
         write_plist(&path, &label, job)?;
         Self::load(&path, &label)?;
         Ok(())
     }
 
-    fn remove(&self, item_id: &str) -> Result<()> {
-        let label = label_for(item_id);
+    fn remove(&self, job_id: &str) -> Result<()> {
+        let label = label_for(job_id);
         Self::unload(&label)?;
-        let path = Self::plist_path(item_id)?;
+        let path = Self::plist_path(job_id)?;
         if path.exists() {
             fs::remove_file(&path)?;
         }
@@ -170,16 +177,29 @@ fn write_plist(path: &Path, label: &str, job: &ScheduledJob) -> Result<()> {
     dict.insert("Comment".into(), Value::String(COMMENT.into()));
     dict.insert(MANAGED_KEY.into(), Value::Boolean(true));
     dict.insert(SCHEMA_KEY.into(), Value::Integer(JOB_SCHEMA.into()));
-    dict.insert(ITEM_KEY.into(), Value::String(job.item_id.clone()));
+    dict.insert(JOB_ID_KEY.into(), Value::String(job.id.clone()));
+    dict.insert(ITEM_KEY.into(), Value::String(job.id.clone()));
+    dict.insert(
+        SELECTORS_KEY.into(),
+        Value::Array(job.selectors.iter().cloned().map(Value::String).collect()),
+    );
     dict.insert(
         "ProgramArguments".into(),
         Value::Array(job.command.iter().cloned().map(Value::String).collect()),
     );
     dict.insert(
-        "StartInterval".into(),
+        EVERY_KEY.into(),
         Value::Integer(i64::try_from(job.every.seconds).unwrap_or(i64::MAX).into()),
     );
-    dict.insert("RunAtLoad".into(), Value::Boolean(false));
+    dict.insert(
+        "StartInterval".into(),
+        Value::Integer(
+            i64::try_from(poll_seconds(job.every.seconds))
+                .unwrap_or(i64::MAX)
+                .into(),
+        ),
+    );
+    dict.insert("RunAtLoad".into(), Value::Boolean(true));
 
     let home = dirs::home_dir().context("home")?;
     let log_dir = home.join("Library/Logs/maclean");
@@ -223,27 +243,45 @@ fn read_job(path: &Path) -> Result<JobFile> {
         .iter()
         .filter_map(|v| v.as_string().map(|s| s.to_string()))
         .collect();
-    let item_id = dict
-        .get(ITEM_KEY)
-        .and_then(Value::as_string)
-        .map(|s| s.to_string())
+    let selectors: Vec<String> = dict
+        .get(SELECTORS_KEY)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_string().map(|s| s.to_string()))
+                .collect()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .or_else(|| {
+            dict.get(ITEM_KEY)
+                .and_then(Value::as_string)
+                .map(|s| vec![s.to_string()])
+        })
         .or_else(|| {
             command
                 .iter()
                 .position(|a| a == "reclaim")
                 .and_then(|i| command.get(i + 1))
-                .cloned()
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| vec![s.clone()])
         })
-        .context("plist is missing MacleanItemId and is not `maclean reclaim <id>`")?;
+        .context("plist is missing selectors")?;
+    let id = dict
+        .get(JOB_ID_KEY)
+        .and_then(Value::as_string)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| job_id(&selectors));
     let seconds = dict
-        .get("StartInterval")
+        .get(EVERY_KEY)
         .and_then(Value::as_signed_integer)
+        .or_else(|| dict.get("StartInterval").and_then(Value::as_signed_integer))
         .unwrap_or(0) as u64;
     Ok(JobFile {
         path: path.to_path_buf(),
         label,
         job: ScheduledJob {
-            item_id,
+            id,
+            selectors,
             every: super::Every {
                 seconds,
                 label: "custom",
@@ -266,12 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_1_roundtrip_keeps_item_id() {
+    fn schema_roundtrip_keeps_selectors_and_interval() {
         let dir = std::env::temp_dir().join(format!("maclean-plist-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("com.maclean.job.spotify-cache.plist");
         let job = ScheduledJob {
-            item_id: "spotify:cache".into(),
+            id: "spotify:cache".into(),
+            selectors: vec!["spotify:cache".into()],
             every: crate::schedule::Every {
                 seconds: 86_400,
                 label: "custom",
@@ -279,15 +318,30 @@ mod tests {
             command: vec![
                 "/tmp/maclean".into(),
                 "reclaim".into(),
-                "spotify:cache".into(),
                 "--yes".into(),
+                "--job".into(),
+                "spotify:cache".into(),
+                "--every".into(),
+                "86400".into(),
+                "spotify:cache".into(),
             ],
             schema: JOB_SCHEMA,
         };
         write_plist(&path, "com.maclean.job.spotify-cache", &job).unwrap();
         let read = read_job(&path).unwrap();
-        assert_eq!(read.job.item_id, "spotify:cache");
+        assert_eq!(read.job.selectors, ["spotify:cache"]);
+        assert_eq!(read.job.every.seconds, 86_400);
         assert_eq!(read.job.schema, JOB_SCHEMA);
+        let value = Value::from_file(&path).unwrap();
+        let dict = value.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("StartInterval").and_then(Value::as_signed_integer),
+            Some(3_600)
+        );
+        assert_eq!(
+            dict.get("RunAtLoad").and_then(Value::as_boolean),
+            Some(true)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -314,7 +368,7 @@ mod tests {
         dict.insert("StartInterval".into(), Value::Integer(86_400.into()));
         Value::Dictionary(dict).to_file_xml(&path).unwrap();
         let read = read_job(&path).unwrap();
-        assert_eq!(read.job.item_id, "spotify:cache");
+        assert_eq!(read.job.selectors, ["spotify:cache"]);
         assert_eq!(read.job.schema, 0);
         let _ = fs::remove_dir_all(&dir);
     }

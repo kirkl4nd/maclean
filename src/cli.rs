@@ -7,7 +7,8 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::core::{
-    Item, ModuleScan, ReclaimContext, Registry, ScanContext, disk_usage, format_bytes,
+    Item, ModuleScan, ReclaimContext, ReclaimResult, Registry, ScanContext, disk_usage,
+    format_bytes, module_of_selector, resolve_selector,
 };
 use crate::schedule::{self, ScheduledJob};
 use crate::tui;
@@ -15,7 +16,7 @@ use crate::tui;
 #[derive(Parser)]
 #[command(
     name = "maclean",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), "\nmaclean · by kirkl4nd"),
     about = "Find and reclaim disk space. Interactive TUI, or flags for scripts and agents.",
     after_help = "\
 EXAMPLES:
@@ -27,7 +28,8 @@ EXAMPLES:
   maclean reclaim spotify:cache    Dry-run a specific item
   maclean reclaim spotify:cache --yes
   maclean reclaim --module docker --all --yes
-  maclean schedule add spotify:cache --every 2w
+  maclean schedule add cargo:projects --every 1d
+  maclean schedule add cargo:projects node:caches --every 1w
   maclean schedule list
   maclean uninstall
   maclean config
@@ -63,6 +65,12 @@ enum Command {
         module: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Record this run against a scheduled job (used by launchd).
+        #[arg(long)]
+        job: Option<String>,
+        /// Skip if this job ran successfully this recently (seconds). Used by launchd.
+        #[arg(long, value_name = "SECONDS")]
+        every: Option<u64>,
     },
     /// List modules, or explain one in the module's own words.
     Modules { id: Option<String> },
@@ -116,12 +124,13 @@ enum ScheduleCmd {
     /// Show jobs maclean has installed. Do not edit the plist files yourself.
     List,
     Add {
-        item_id: String,
+        /// Catalog actions, e.g. cargo:projects. Not a scan-result id.
+        selectors: Vec<String>,
         #[arg(long)]
         every: String,
     },
     Remove {
-        item_id: String,
+        job_id: String,
     },
 }
 
@@ -148,13 +157,21 @@ pub fn run() -> Result<()> {
         Some(Command::Scan { module }) => {
             cmd_scan(&registry, &ctx, module.as_deref(), cli.json)?;
         }
-        Some(Command::Reclaim { ids, module, all }) => {
+        Some(Command::Reclaim {
+            ids,
+            module,
+            all,
+            job,
+            every,
+        }) => {
             cmd_reclaim(
                 &registry,
                 &ctx,
                 ids,
                 module.as_deref(),
                 all,
+                job.as_deref(),
+                every,
                 cli.yes,
                 cli.json,
             )?;
@@ -163,7 +180,7 @@ pub fn run() -> Result<()> {
             Some(id) => cmd_module_info(&registry, &ctx, &id, cli.json)?,
             None => cmd_modules(&registry, &ctx, cli.json)?,
         },
-        Some(Command::Schedule { cmd }) => cmd_schedule(cmd, cli.json)?,
+        Some(Command::Schedule { cmd }) => cmd_schedule(&registry, cmd, cli.json)?,
         Some(Command::Uninstall { .. }) => unreachable!("handled before config load"),
         Some(Command::Config { cmd, init }) => {
             cmd_config(&registry, &mut ctx, cmd, init, cli.json)?
@@ -252,18 +269,23 @@ fn cmd_reclaim(
     ids: Vec<String>,
     module: Option<&str>,
     all: bool,
+    job: Option<&str>,
+    every: Option<u64>,
     yes: bool,
     json: bool,
 ) -> Result<()> {
-    let tree = if let Some(id) = module {
-        registry
-            .scan_module(id, ctx)?
-            .tree_root()
-            .into_iter()
-            .collect()
-    } else {
-        registry.tree(ctx)
-    };
+    if let (Some(job), Some(every)) = (job, every) {
+        if !schedule::job_due(job, every) {
+            return Ok(());
+        }
+    }
+    if !all && ids.is_empty() {
+        bail!("pass item ids, or use --all");
+    }
+
+    let tree = reclaim_forest(registry, ctx, module, all, &ids)?;
+    let catalog: std::collections::HashSet<&str> =
+        registry.schedule_targets().iter().map(|t| t.id).collect();
 
     let selected: Vec<Item> = if all {
         tree.iter()
@@ -271,36 +293,60 @@ fn cmd_reclaim(
             .cloned()
             .collect()
     } else {
-        if ids.is_empty() {
-            bail!("pass item ids, or use --all");
-        }
         let mut found = Vec::new();
         for id in &ids {
-            match crate::core::find_in_forest(&tree, id) {
+            match resolve_selector(&tree, id) {
                 Some(item) => found.push(item.clone()),
+                None if catalog.contains(id.as_str()) || job.is_some() => {}
                 None => bail!("item '{id}' not found (run `maclean scan`)"),
             }
         }
         found
     };
+
     if selected.is_empty() {
-        bail!("nothing to reclaim");
+        if let Some(job) = job {
+            if yes {
+                schedule::record_run(job, 0, 0);
+            }
+        }
+        if json {
+            print_json(&Vec::<ReclaimResult>::new())?;
+            return Ok(());
+        }
+        println!("nothing to do this run");
+        return Ok(());
     }
 
     let reclaim_ctx = ReclaimContext::from_scan(ctx, !yes, yes && std::io::stdin().is_terminal());
 
     let mut results = Vec::new();
+    let mut errors = 0u64;
     for item in &selected {
         match registry.reclaim(item, &reclaim_ctx) {
             Ok(rs) => results.extend(rs),
             Err(err) => {
+                errors += 1;
                 if json {
+                    if let Some(job) = job {
+                        if yes {
+                            schedule::record_run(job, 0, errors);
+                        }
+                    }
                     bail!("{err}");
                 }
                 eprintln!("error: {err}");
             }
         }
     }
+
+    if let Some(job) = job {
+        if yes {
+            let bytes = results.iter().map(|r| r.bytes_reclaimed).sum();
+            schedule::record_run(job, bytes, errors);
+        }
+    }
+
     if json {
         print_json(&results)?;
         return Ok(());
@@ -318,6 +364,52 @@ fn cmd_reclaim(
         eprintln!("Re-run with --yes to apply.");
     }
     Ok(())
+}
+
+/// Scan only the modules a reclaim needs. Catalog selectors are looked up
+/// at run time — a project that is not there yet is not an error.
+fn reclaim_forest(
+    registry: &Registry,
+    ctx: &ScanContext,
+    module: Option<&str>,
+    all: bool,
+    ids: &[String],
+) -> Result<Vec<Item>> {
+    if let Some(id) = module {
+        let scan = registry.scan_module_for_reclaim(id, ctx)?;
+        return Ok(if let Some(root) = scan.tree_root() {
+            vec![root]
+        } else {
+            scan.items
+        });
+    }
+    if all {
+        return Ok(registry.tree(ctx));
+    }
+
+    let mut modules = std::collections::BTreeSet::new();
+    for id in ids {
+        modules.insert(module_of_selector(id).to_string());
+    }
+
+    let mut forest = Vec::new();
+    let mut unknown = false;
+    for mid in modules {
+        match registry.scan_module_for_reclaim(&mid, ctx) {
+            Ok(scan) => {
+                if let Some(root) = scan.tree_root() {
+                    forest.push(root);
+                } else {
+                    forest.extend(scan.items);
+                }
+            }
+            Err(_) => unknown = true,
+        }
+    }
+    if forest.is_empty() && unknown {
+        forest = registry.tree(ctx);
+    }
+    Ok(forest)
 }
 
 fn cmd_modules(registry: &Registry, ctx: &ScanContext, json: bool) -> Result<()> {
@@ -399,13 +491,27 @@ fn cmd_module_info(registry: &Registry, ctx: &ScanContext, id: &str, json: bool)
     Ok(())
 }
 
-fn cmd_schedule(cmd: ScheduleCmd, json: bool) -> Result<()> {
+fn cmd_schedule(registry: &Registry, cmd: ScheduleCmd, json: bool) -> Result<()> {
     let scheduler = schedule::current();
     match cmd {
         ScheduleCmd::List => {
             let jobs = scheduler.list()?;
             if json {
-                print_json(&jobs)?;
+                let rows: Vec<serde_json::Value> = jobs
+                    .iter()
+                    .map(|job| {
+                        let stats = schedule::job_stats(&job.id);
+                        serde_json::json!({
+                            "id": job.id,
+                            "selectors": job.selectors,
+                            "every": job.every.display(),
+                            "command": job.command,
+                            "schema": job.schema,
+                            "stats": stats,
+                        })
+                    })
+                    .collect();
+                print_json(&rows)?;
                 return Ok(());
             }
             if jobs.is_empty() {
@@ -413,20 +519,38 @@ fn cmd_schedule(cmd: ScheduleCmd, json: bool) -> Result<()> {
                 return Ok(());
             }
             for job in jobs {
-                println!(
-                    "{:<32}  {:<16}  {}",
-                    job.item_id,
-                    job.every.display(),
-                    job.command.join(" ")
-                );
+                let stats = schedule::job_stats(&job.id);
+                println!("{:<40}  {}", job.selectors.join(" "), job.every.display());
+                println!("  {}", stats.summary());
             }
         }
-        ScheduleCmd::Add { item_id, every } => {
+        ScheduleCmd::Add { selectors, every } => {
+            if selectors.is_empty() {
+                bail!("pass at least one action, e.g. cargo:projects");
+            }
+            let catalog: std::collections::HashSet<&str> =
+                registry.schedule_targets().iter().map(|t| t.id).collect();
+            for id in &selectors {
+                if !schedule::valid_selector(id) {
+                    bail!("invalid selector '{id}'");
+                }
+                if !catalog.contains(id.as_str()) {
+                    let known = registry
+                        .schedule_targets()
+                        .iter()
+                        .map(|t| t.id)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!("unknown action '{id}'. Known: {known}");
+                }
+            }
             let every = schedule::parse_every(&every)?;
+            let id = schedule::job_id(&selectors);
             let job = ScheduledJob {
-                item_id: item_id.clone(),
+                id: id.clone(),
+                selectors: selectors.clone(),
                 every,
-                command: schedule::maclean_command(&item_id)?,
+                command: schedule::maclean_command(&id, &selectors, every.seconds)?,
                 schema: schedule::JOB_SCHEMA,
             };
             scheduler.add(&job)?;
@@ -435,18 +559,18 @@ fn cmd_schedule(cmd: ScheduleCmd, json: bool) -> Result<()> {
             } else {
                 println!(
                     "scheduled {} ({})\n  {}",
-                    job.item_id,
+                    job.selectors.join(" "),
                     job.every.display(),
                     job.command.join(" ")
                 );
             }
         }
-        ScheduleCmd::Remove { item_id } => {
-            scheduler.remove(&item_id)?;
+        ScheduleCmd::Remove { job_id } => {
+            scheduler.remove(&job_id)?;
             if json {
-                print_json(&serde_json::json!({ "removed": item_id }))?;
+                print_json(&serde_json::json!({ "removed": job_id }))?;
             } else {
-                println!("removed schedule for {item_id}");
+                println!("removed schedule for {job_id}");
             }
         }
     }
@@ -463,7 +587,7 @@ fn cmd_uninstall(purge_data: bool) -> Result<()> {
             crate::core::plural(removed.len(), "scheduled job")
         );
         for job in &removed {
-            println!("  {}", job.item_id);
+            println!("  {}", job.selectors.join(" "));
         }
     }
 

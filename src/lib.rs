@@ -12,6 +12,8 @@ pub mod modules;
 pub mod schedule;
 pub mod tui;
 
+pub const CREDIT: &str = "maclean · by kirkl4nd";
+
 pub use core::{
     Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimResult, Registry, Relevance,
     Safety, ScanContext, ScanEvent, ScanIssue, format_bytes, running_as_root,

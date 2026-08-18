@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::core::{
     IssueKind, Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult,
-    Relevance, Safety, ScanContext, ScanIssue, allocated_bytes, delete_tree, format_bytes,
-    run_command, run_scan, run_scan_with,
+    Relevance, Safety, ScanContext, ScanIssue, ScheduleTarget, allocated_bytes, delete_tree,
+    format_bytes, run_command, run_scan, run_scan_with,
 };
 
 pub struct DockerModule;
@@ -100,6 +100,31 @@ impl Module for DockerModule {
 
     fn path_dirs(&self) -> &'static [&'static str] {
         &["/Applications/Docker.app/Contents/Resources/bin"]
+    }
+
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        vec![
+            ScheduleTarget::new(
+                "docker:build-cache",
+                "Build cache",
+                "docker builder prune when the job runs",
+            ),
+            ScheduleTarget::new(
+                "docker:images",
+                "Unused images",
+                "docker image prune --all when the job runs",
+            ),
+            ScheduleTarget::new(
+                "docker:volumes",
+                "Unused volumes",
+                "docker volume prune when the job runs",
+            ),
+            ScheduleTarget::new(
+                "docker:containers",
+                "Stopped containers",
+                "docker container prune when the job runs",
+            ),
+        ]
     }
 
     fn paths(&self) -> Vec<(&'static str, &'static str)> {

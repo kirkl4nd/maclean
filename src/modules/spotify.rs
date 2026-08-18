@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::core::{
     IssueKind, Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult,
-    Relevance, Safety, ScanContext, delete_contents, dir_size_in, format_bytes,
+    Relevance, Safety, ScanContext, ScheduleTarget, delete_contents, dir_size_in, format_bytes,
 };
 
 pub struct SpotifyModule;
@@ -26,6 +26,14 @@ impl Module for SpotifyModule {
     }
     fn description(&self) -> &'static str {
         "Offline/stream cache used by the Spotify desktop app"
+    }
+
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        vec![ScheduleTarget::new(
+            "spotify:cache",
+            "Spotify cache",
+            "Offline and stream cache for the desktop app",
+        )]
     }
 
     fn paths(&self) -> Vec<(&'static str, &'static str)> {

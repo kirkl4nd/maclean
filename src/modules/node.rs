@@ -4,8 +4,8 @@ use walkdir::WalkDir;
 
 use crate::core::{
     IssueKind, Item, Module, ModuleInfo, ModuleScan, ReclaimContext, ReclaimError, ReclaimResult,
-    Relevance, Safety, ScanContext, ScanIssue, delete_contents, delete_tree, dir_size, dir_size_in,
-    exists_named_within, format_bytes, run_command, skip_walk_dir,
+    Relevance, Safety, ScanContext, ScheduleTarget, delete_contents, delete_tree, dir_size,
+    dir_size_in, exists_named_within, format_bytes, run_command, skip_walk_dir,
 };
 
 /// A `node_modules` smaller than this is not worth a row in the tree.
@@ -106,7 +106,7 @@ impl NodeModule {
 
 /// Walk each search root only. Do not follow symlinks: a Wine `z:` drive
 /// is a link to `/`, and `Path::is_dir` would happily walk `/opt` from `~`.
-fn find_node_modules(roots: &[PathBuf], issues: &mut Vec<ScanIssue>) -> Vec<PathBuf> {
+fn find_node_modules(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for root in roots {
         if !root.is_dir() {
@@ -137,15 +137,6 @@ fn find_node_modules(roots: &[PathBuf], issues: &mut Vec<ScanIssue>) -> Vec<Path
             match entry {
                 Ok(e) if e.file_type().is_dir() && e.file_name() == "node_modules" => {
                     found.push(e.path().to_path_buf());
-                }
-                Err(err) => {
-                    if issues.len() < 8 {
-                        let p = err
-                            .path()
-                            .map(Path::to_path_buf)
-                            .unwrap_or_else(|| root.clone());
-                        issues.push(ScanIssue::permission(p, err.to_string()));
-                    }
                 }
                 _ => {}
             }
@@ -193,6 +184,21 @@ impl Module for NodeModule {
 
     fn searches(&self) -> bool {
         true
+    }
+
+    fn schedule_targets(&self) -> Vec<ScheduleTarget> {
+        vec![
+            ScheduleTarget::new(
+                "node:caches",
+                "Package manager caches",
+                "npm, Yarn, pnpm, Bun download caches found when the job runs",
+            ),
+            ScheduleTarget::new(
+                "node:modules",
+                "Project node_modules",
+                "Large node_modules folders found when the job runs",
+            ),
+        ]
     }
 
     fn info(&self, ctx: &ScanContext) -> ModuleInfo {
@@ -288,7 +294,7 @@ impl Module for NodeModule {
         }
 
         let mut projects = Vec::new();
-        for dir in find_node_modules(&Self::roots(ctx), &mut scan.issues) {
+        for dir in find_node_modules(&Self::roots(ctx)) {
             if ctx.cancelled() {
                 return scan;
             }
@@ -467,11 +473,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("maclean-nm-ok-{}", std::process::id()));
         let modules = root.join("proj/node_modules");
         touch_dir(&modules);
-        let mut issues = Vec::new();
-        let found = find_node_modules(&[root.clone()], &mut issues);
+        let found = find_node_modules(&[root.clone()]);
         let _ = fs::remove_dir_all(&root);
         assert_eq!(found, vec![modules]);
-        assert!(issues.is_empty());
     }
 
     #[test]
@@ -482,8 +486,7 @@ mod tests {
         touch_dir(&outside);
         touch_dir(&root);
         std::os::unix::fs::symlink(tmp.join("opt"), root.join("opt-link")).unwrap();
-        let mut issues = Vec::new();
-        let found = find_node_modules(&[root], &mut issues);
+        let found = find_node_modules(&[root]);
         let _ = fs::remove_dir_all(&tmp);
         assert!(
             found.is_empty(),
@@ -501,8 +504,7 @@ mod tests {
         touch_dir(&dos);
         std::os::unix::fs::symlink("/", dos.join("z:")).unwrap();
         std::os::unix::fs::symlink(tmp.join("opt"), dos.join("opt-also")).unwrap();
-        let mut issues = Vec::new();
-        let found = find_node_modules(&[home], &mut issues);
+        let found = find_node_modules(&[home]);
         let _ = fs::remove_dir_all(&tmp);
         assert!(
             found.iter().all(|p| !p.to_string_lossy().contains("/opt/")),
